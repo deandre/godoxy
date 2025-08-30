@@ -117,12 +117,50 @@ func NewOIDCProviderFromEnv() (*OIDCProvider, error) {
 	)
 }
 
+// NewOIDCProviderWithCustomClient creates a new OIDCProvider with custom client credentials
+// while reusing the existing provider instance for issuer discovery and endpoints.
+func NewOIDCProviderWithCustomClient(
+	baseProvider *OIDCProvider,
+	clientID, clientSecret string,
+) (*OIDCProvider, error) {
+	if clientID == "" || clientSecret == "" {
+		return nil, errors.New("client_id and client_secret are required")
+	}
+
+	return &OIDCProvider{
+		oauthConfig: &oauth2.Config{
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+			RedirectURL:  baseProvider.oauthConfig.RedirectURL,
+			Endpoint:     baseProvider.oauthConfig.Endpoint, // reuse from base
+			Scopes:       baseProvider.oauthConfig.Scopes,   // reuse from base
+		},
+		oidcProvider: baseProvider.oidcProvider, // reuse from base
+		oidcVerifier: baseProvider.oidcProvider.Verifier(&oidc.Config{
+			ClientID: clientID, // Use custom client ID for verification
+		}),
+		endSessionURL: baseProvider.endSessionURL, // reuse from base
+		allowedUsers:  baseProvider.allowedUsers,  // will be overridden
+		allowedGroups: baseProvider.allowedGroups, // will be overridden
+	}, nil
+}
+
 func (auth *OIDCProvider) SetAllowedUsers(users []string) {
 	auth.allowedUsers = users
 }
 
 func (auth *OIDCProvider) SetAllowedGroups(groups []string) {
 	auth.allowedGroups = groups
+}
+
+// SetScopes sets the OAuth2 scopes for the OIDC provider.
+func (auth *OIDCProvider) SetScopes(scopes []string) {
+	auth.oauthConfig.Scopes = scopes
+}
+
+// GetScopes returns the current OAuth2 scopes for the OIDC provider.
+func (auth *OIDCProvider) GetScopes() []string {
+	return auth.oauthConfig.Scopes
 }
 
 // optRedirectPostAuth returns an oauth2 option that sets the "redirect_uri"
