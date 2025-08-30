@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/rs/zerolog"
 	maxmind "github.com/yusing/go-proxy/internal/maxmind/types"
@@ -51,6 +52,22 @@ func appendRequestURI(line []byte, req *http.Request, query iter.Seq2[string, []
 }
 
 func clientIP(req *http.Request) string {
+	// Check for forwarded headers in order of preference
+	if ip := req.Header.Get("CF-Connecting-IP"); ip != "" {
+		return ip
+	}
+	if ip := req.Header.Get("X-Real-IP"); ip != "" {
+		return ip
+	}
+	if ip := req.Header.Get("X-Forwarded-For"); ip != "" {
+		// X-Forwarded-For can contain multiple IPs, take the first one
+		if commaIndex := strings.Index(ip, ","); commaIndex != -1 {
+			return strings.TrimSpace(ip[:commaIndex])
+		}
+		return strings.TrimSpace(ip)
+	}
+	
+	// Fall back to RemoteAddr
 	clientIP, _, err := net.SplitHostPort(req.RemoteAddr)
 	if err == nil {
 		return clientIP
