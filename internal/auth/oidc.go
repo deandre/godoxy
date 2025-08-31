@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
@@ -39,11 +40,25 @@ type (
 
 var _ Provider = (*OIDCProvider)(nil)
 
+// Cookie names for OIDC authentication
 const (
+	CookieOauthSessionToken = "godoxy_session_token"
+	CookieOauthToken        = "godoxy_oauth_token"
 	CookieOauthState        = "godoxy_oidc_state"
-	CookieOauthToken        = "godoxy_oauth_token"   //nolint:gosec
-	CookieOauthSessionToken = "godoxy_session_token" //nolint:gosec
 )
+
+// getAppScopedCookieName returns a cookie name scoped to the specific application
+// to prevent conflicts between different OIDC clients
+func (auth *OIDCProvider) getAppScopedCookieName(baseName string) string {
+	// Use the client ID to scope the cookie name
+	// This prevents conflicts when multiple apps use different client IDs
+	if auth.oauthConfig.ClientID != "" {
+		// Create a hash of the client ID to keep cookie names short
+		hash := fmt.Sprintf("%x", md5.Sum([]byte(auth.oauthConfig.ClientID)))
+		return fmt.Sprintf("%s_%s", baseName, hash[:8])
+	}
+	return baseName
+}
 
 const (
 	OIDCAuthInitPath = "/"
@@ -117,12 +132,50 @@ func NewOIDCProviderFromEnv() (*OIDCProvider, error) {
 	)
 }
 
+// NewOIDCProviderWithCustomClient creates a new OIDCProvider with custom client credentials
+// while reusing the existing provider instance for issuer discovery and endpoints.
+func NewOIDCProviderWithCustomClient(
+	baseProvider *OIDCProvider,
+	clientID, clientSecret string,
+) (*OIDCProvider, error) {
+	if clientID == "" || clientSecret == "" {
+		return nil, errors.New("client_id and client_secret are required")
+	}
+
+	return &OIDCProvider{
+		oauthConfig: &oauth2.Config{
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+			RedirectURL:  baseProvider.oauthConfig.RedirectURL,
+			Endpoint:     baseProvider.oauthConfig.Endpoint, // reuse from base
+			Scopes:       baseProvider.oauthConfig.Scopes,   // reuse from base
+		},
+		oidcProvider: baseProvider.oidcProvider, // reuse from base
+		oidcVerifier: baseProvider.oidcProvider.Verifier(&oidc.Config{
+			ClientID: clientID, // Use custom client ID for verification
+		}),
+		endSessionURL: baseProvider.endSessionURL, // reuse from base
+		allowedUsers:  baseProvider.allowedUsers,  // will be overridden
+		allowedGroups: baseProvider.allowedGroups, // will be overridden
+	}, nil
+}
+
 func (auth *OIDCProvider) SetAllowedUsers(users []string) {
 	auth.allowedUsers = users
 }
 
 func (auth *OIDCProvider) SetAllowedGroups(groups []string) {
 	auth.allowedGroups = groups
+}
+
+// SetScopes sets the OAuth2 scopes for the OIDC provider.
+func (auth *OIDCProvider) SetScopes(scopes []string) {
+	auth.oauthConfig.Scopes = scopes
+}
+
+// GetScopes returns the current OAuth2 scopes for the OIDC provider.
+func (auth *OIDCProvider) GetScopes() []string {
+	return auth.oauthConfig.Scopes
 }
 
 // optRedirectPostAuth returns an oauth2 option that sets the "redirect_uri"
@@ -137,6 +190,12 @@ func (auth *OIDCProvider) getIDToken(ctx context.Context, oauthToken *oauth2.Tok
 	if !ok {
 		return "", nil, errMissingIDToken
 	}
+
+	// Debug logging to see what client ID is being used
+	log.Debug().
+		Str("oauth_client_id", auth.oauthConfig.ClientID).
+		Msg("verifying ID token with client ID")
+
 	idToken, err := auth.oidcVerifier.Verify(ctx, idTokenJWT)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to verify ID token: %w", err)
@@ -169,7 +228,7 @@ var rateLimit = rate.NewLimiter(rate.Every(time.Second), 1)
 
 func (auth *OIDCProvider) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	// check for session token
-	sessionToken, err := r.Cookie(CookieOauthSessionToken)
+	sessionToken, err := r.Cookie(auth.getAppScopedCookieName(CookieOauthSessionToken))
 	if err == nil { // session token exists
 		result, err := auth.TryRefreshToken(r.Context(), sessionToken.Value)
 		// redirect back to where they requested
@@ -193,7 +252,7 @@ func (auth *OIDCProvider) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	state := generateState()
-	SetTokenCookie(w, r, CookieOauthState, state, 300*time.Second)
+	SetTokenCookie(w, r, auth.getAppScopedCookieName(CookieOauthState), state, 300*time.Second)
 	// redirect user to Idp
 	url := auth.oauthConfig.AuthCodeURL(state, optRedirectPostAuth(r))
 	if IsFrontend(r) {
@@ -228,7 +287,7 @@ func (auth *OIDCProvider) checkAllowed(user string, groups []string) bool {
 }
 
 func (auth *OIDCProvider) CheckToken(r *http.Request) error {
-	tokenCookie, err := r.Cookie(CookieOauthToken)
+	tokenCookie, err := r.Cookie(auth.getAppScopedCookieName(CookieOauthToken))
 	if err != nil {
 		return ErrMissingOAuthToken
 	}
@@ -257,15 +316,36 @@ func (auth *OIDCProvider) PostAuthCallbackHandler(w http.ResponseWriter, r *http
 	}
 
 	// verify state
-	state, err := r.Cookie(CookieOauthState)
+	state, err := r.Cookie(auth.getAppScopedCookieName(CookieOauthState))
 	if err != nil {
+		log.Debug().
+			Str("client_id", auth.oauthConfig.ClientID).
+			Str("cookie_name", auth.getAppScopedCookieName(CookieOauthState)).
+			Msg("missing state cookie")
 		http.Error(w, "missing state cookie", http.StatusBadRequest)
 		return
 	}
-	if r.URL.Query().Get("state") != state.Value {
+
+	expectedState := r.URL.Query().Get("state")
+	if expectedState != state.Value {
+		log.Debug().
+			Str("client_id", auth.oauthConfig.ClientID).
+			Str("expected_state", expectedState).
+			Str("actual_state", state.Value).
+			Msg("invalid oauth state")
+		// Clear the invalid state cookie to prevent future conflicts
+		ClearTokenCookie(w, r, auth.getAppScopedCookieName(CookieOauthState))
 		http.Error(w, "invalid oauth state", http.StatusBadRequest)
 		return
 	}
+
+	log.Debug().
+		Str("client_id", auth.oauthConfig.ClientID).
+		Str("state", state.Value).
+		Msg("oauth state verified successfully")
+
+	// Clear the state cookie after successful verification
+	ClearTokenCookie(w, r, auth.getAppScopedCookieName(CookieOauthState))
 
 	code := r.URL.Query().Get("code")
 	oauth2Token, err := auth.oauthConfig.Exchange(r.Context(), code, optRedirectPostAuth(r))
@@ -297,8 +377,8 @@ func (auth *OIDCProvider) PostAuthCallbackHandler(w http.ResponseWriter, r *http
 }
 
 func (auth *OIDCProvider) LogoutHandler(w http.ResponseWriter, r *http.Request) {
-	oauthToken, _ := r.Cookie(CookieOauthToken)
-	sessionToken, _ := r.Cookie(CookieOauthSessionToken)
+	oauthToken, _ := r.Cookie(auth.getAppScopedCookieName(CookieOauthToken))
+	sessionToken, _ := r.Cookie(auth.getAppScopedCookieName(CookieOauthSessionToken))
 	auth.clearCookie(w, r)
 
 	if sessionToken != nil {
@@ -325,26 +405,32 @@ func (auth *OIDCProvider) LogoutHandler(w http.ResponseWriter, r *http.Request) 
 }
 
 func (auth *OIDCProvider) setIDTokenCookie(w http.ResponseWriter, r *http.Request, jwt string, ttl time.Duration) {
-	SetTokenCookie(w, r, CookieOauthToken, jwt, ttl)
+	SetTokenCookie(w, r, auth.getAppScopedCookieName(CookieOauthToken), jwt, ttl)
 }
 
 func (auth *OIDCProvider) clearCookie(w http.ResponseWriter, r *http.Request) {
-	ClearTokenCookie(w, r, CookieOauthToken)
-	ClearTokenCookie(w, r, CookieOauthSessionToken)
+	ClearTokenCookie(w, r, auth.getAppScopedCookieName(CookieOauthToken))
+	ClearTokenCookie(w, r, auth.getAppScopedCookieName(CookieOauthSessionToken))
+	ClearTokenCookie(w, r, auth.getAppScopedCookieName(CookieOauthState))
 }
 
 // handleTestCallback handles OIDC callback in test environment.
 func (auth *OIDCProvider) handleTestCallback(w http.ResponseWriter, r *http.Request) {
-	state, err := r.Cookie(CookieOauthState)
+	state, err := r.Cookie(auth.getAppScopedCookieName(CookieOauthState))
 	if err != nil {
 		http.Error(w, "missing state cookie", http.StatusBadRequest)
 		return
 	}
 
 	if r.URL.Query().Get("state") != state.Value {
+		// Clear the invalid state cookie to prevent future conflicts
+		ClearTokenCookie(w, r, auth.getAppScopedCookieName(CookieOauthState))
 		http.Error(w, "invalid oauth state", http.StatusBadRequest)
 		return
 	}
+
+	// Clear the state cookie after successful verification
+	ClearTokenCookie(w, r, auth.getAppScopedCookieName(CookieOauthState))
 
 	// Create test JWT token
 	SetTokenCookie(w, r, CookieOauthToken, "test", time.Hour)

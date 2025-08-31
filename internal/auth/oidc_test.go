@@ -481,3 +481,60 @@ func TestLogoutHandler(t *testing.T) {
 		t.Error("LogoutHandler() did not clear all cookies")
 	}
 }
+
+func TestNewOIDCProviderWithCustomClient(t *testing.T) {
+	// Use the existing mock OIDC setup
+	setupMockOIDC(t)
+	t.Cleanup(cleanup)
+
+	t.Run("creates provider with custom client credentials", func(t *testing.T) {
+		// Get the mock provider that was set up
+		baseProvider := defaultAuth.(*OIDCProvider)
+
+		customProvider, err := NewOIDCProviderWithCustomClient(
+			baseProvider,
+			"custom-client-id",
+			"custom-client-secret",
+		)
+		ExpectNoError(t, err)
+
+		// Should have custom client credentials
+		ExpectEqual(t, customProvider.oauthConfig.ClientID, "custom-client-id")
+		ExpectEqual(t, customProvider.oauthConfig.ClientSecret, "custom-client-secret")
+
+		// Should reuse base provider infrastructure
+		ExpectEqual(t, customProvider.oidcProvider, baseProvider.oidcProvider)
+		ExpectEqual(t, customProvider.endSessionURL, baseProvider.endSessionURL)
+		ExpectEqual(t, customProvider.oauthConfig.Endpoint, baseProvider.oauthConfig.Endpoint)
+		ExpectEqual(t, customProvider.oauthConfig.Scopes, baseProvider.oauthConfig.Scopes)
+
+		// Should have a new verifier with custom client ID (not equal to base verifier)
+		ExpectTrue(t, customProvider.oidcVerifier != baseProvider.oidcVerifier)
+	})
+
+	t.Run("requires both client_id and client_secret", func(t *testing.T) {
+		baseProvider := defaultAuth.(*OIDCProvider)
+
+		// Missing client_secret
+		_, err := NewOIDCProviderWithCustomClient(baseProvider, "client-id", "")
+		ExpectHasError(t, err)
+		ExpectEqual(t, err.Error(), "client_id and client_secret are required")
+
+		// Missing client_id
+		_, err = NewOIDCProviderWithCustomClient(baseProvider, "", "client-secret")
+		ExpectHasError(t, err)
+		ExpectEqual(t, err.Error(), "client_id and client_secret are required")
+	})
+
+	t.Run("SetScopes and GetScopes work correctly", func(t *testing.T) {
+		baseProvider := defaultAuth.(*OIDCProvider)
+
+		// Test SetScopes
+		customScopes := []string{"openid", "profile", "email", "groups"}
+		baseProvider.SetScopes(customScopes)
+		ExpectEqual(t, baseProvider.GetScopes(), customScopes)
+
+		// Test that it actually changed the oauth config
+		ExpectEqual(t, baseProvider.oauthConfig.Scopes, customScopes)
+	})
+}
