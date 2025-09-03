@@ -2,12 +2,12 @@ package api
 
 import (
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
-	swaggerFiles "github.com/swaggo/files"
-	ginSwagger "github.com/swaggo/gin-swagger"
 	apitypes "github.com/yusing/go-proxy/internal/api/types"
 	apiV1 "github.com/yusing/go-proxy/internal/api/v1"
 	agentApi "github.com/yusing/go-proxy/internal/api/v1/agent"
@@ -41,28 +41,23 @@ import (
 func NewHandler() *gin.Engine {
 	gin.SetMode("release")
 	r := gin.New()
-	r.Use(NoCache())
 	r.Use(ErrorHandler())
 	r.Use(ErrorLoggingMiddleware())
 
 	docs.SwaggerInfo.Title = "GoDoxy API"
 	docs.SwaggerInfo.BasePath = "/api/v1"
 
-	v1Auth := r.Group("/api/v1/auth")
-	{
-		v1Auth.HEAD("/check", authApi.Check)
-		v1Auth.POST("/login", authApi.Login)
-		v1Auth.GET("/callback", authApi.Callback)
-		v1Auth.POST("/callback", authApi.Callback)
-		v1Auth.POST("/logout", authApi.Logout)
-	}
+	r.GET("/api/v1/version", apiV1.Version)
 
-	v1Swagger := r.Group("/api/v1/swagger")
-	{
-		v1Swagger.GET("/:any", func(c *gin.Context) {
-			c.Redirect(http.StatusTemporaryRedirect, "/api/v1/swagger/index.html")
-		})
-		v1Swagger.GET("/:any/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+	if auth.IsEnabled() {
+		v1Auth := r.Group("/api/v1/auth")
+		{
+			v1Auth.HEAD("/check", authApi.Check)
+			v1Auth.POST("/login", authApi.Login)
+			v1Auth.GET("/callback", authApi.Callback)
+			v1Auth.POST("/callback", authApi.Callback)
+			v1Auth.POST("/logout", authApi.Logout)
+		}
 	}
 
 	v1 := r.Group("/api/v1")
@@ -73,12 +68,12 @@ func NewHandler() *gin.Engine {
 		v1.Use(SkipOriginCheckMiddleware())
 	}
 	{
-		v1.GET("/favicon", apiV1.FavIcon)
+		// enable cache for favicon
+		v1.GET("/favicon", apiV1.FavIcon).Use(Cache(time.Hour * 24))
 		v1.GET("/health", apiV1.Health)
 		v1.GET("/icons", apiV1.Icons)
 		v1.POST("/reload", apiV1.Reload)
 		v1.GET("/stats", apiV1.Stats)
-		v1.GET("/version", apiV1.Version)
 
 		route := v1.Group("/route")
 		{
@@ -134,14 +129,33 @@ func NewHandler() *gin.Engine {
 		}
 	}
 
+	// disable cache by default
+	r.Use(NoCache())
 	return r
 }
 
 func NoCache() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
-		c.Header("Pragma", "no-cache")
-		c.Header("Expires", "0")
+		// skip cache if Cache-Control header is set or if caching is explicitly enabled
+		if !c.GetBool("cache_enabled") && c.Writer.Header().Get("Cache-Control") == "" {
+			c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+			c.Header("Pragma", "no-cache")
+			c.Header("Expires", "0")
+		}
+		c.Next()
+	}
+}
+
+func Cache(duration time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Signal to NoCache middleware that caching is intended
+		c.Set("cache_enabled", true)
+		// skip cache if Cache-Control header is set
+		if c.Writer.Header().Get("Cache-Control") == "" {
+			c.Header("Cache-Control", "public, max-age="+strconv.FormatFloat(duration.Seconds(), 'f', 0, 64)+", immutable")
+			c.Header("Pragma", "public")
+			c.Header("Expires", time.Now().Add(duration).Format(time.RFC1123))
+		}
 		c.Next()
 	}
 }

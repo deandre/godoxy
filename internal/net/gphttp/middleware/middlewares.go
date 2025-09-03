@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"errors"
+	"io/fs"
 	"path"
 
 	"github.com/rs/zerolog/log"
@@ -15,7 +17,8 @@ import (
 var allMiddlewares = map[string]*Middleware{
 	"redirecthttp": RedirectHTTP,
 
-	"oidc": OIDC,
+	"oidc":        OIDC,
+	"forwardauth": ForwardAuth,
 
 	"request":        ModifyRequest,
 	"modifyrequest":  ModifyRequest,
@@ -62,6 +65,9 @@ func LoadComposeFiles() {
 	errs := gperr.NewBuilder("middleware compile errors")
 	middlewareDefs, err := utils.ListFiles(common.MiddlewareComposeBasePath, 0)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return
+		}
 		log.Err(err).Msg("failed to list middleware definitions")
 		return
 	}
